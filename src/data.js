@@ -259,7 +259,7 @@ QueryBuilder.prototype.getOperators = function(filter) {
  * @return {object|null}
  */
 QueryBuilder.prototype.getFilterById = function(id) {
-    if (id == '-1') {
+    if (id == '-1' || id == "") {
         return null;
     }
 
