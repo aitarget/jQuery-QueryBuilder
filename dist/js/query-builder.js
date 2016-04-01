@@ -252,6 +252,7 @@ QueryBuilder.DEFAULTS = {
     filters: [],
     plugins: [],
 
+    sort_filters: false,
     display_errors: true,
     allow_groups: -1,
     allow_empty: false,
@@ -469,6 +470,18 @@ QueryBuilder.prototype.checkFilters = function(filters) {
                 break;
         }
     }, this);
+
+    if (this.settings.sort_filters) {
+        if (typeof this.settings.sort_filters == 'function') {
+            filters.sort(this.settings.sort_filters);
+        }
+        else {
+            var self = this;
+            filters.sort(function(a, b) {
+                return self.translateLabel(a.label).localeCompare(self.translateLabel(b.label));
+            });
+        }
+    }
 
     if (this.status.has_optgroup) {
         filters = Utils.groupSort(filters, 'optgroup');
@@ -1602,7 +1615,7 @@ QueryBuilder.prototype.getOperators = function(filter) {
  * @return {object|null}
  */
 QueryBuilder.prototype.getFilterById = function(id) {
-    if (id == '-1') {
+    if (id == '-1' || id == "") {
         return null;
     }
 
@@ -1840,7 +1853,7 @@ QueryBuilder.prototype.getGroupFlags = function(flags, all) {
  * @return string
  */
 QueryBuilder.prototype.translateLabel = function(label) {
-    return typeof label == 'string' ? label : label[this.settings.lang_code] || label['en'];
+    return typeof label == 'object' ? (label[this.settings.lang_code] || label['en']) : label;
 };
 
 
@@ -3588,6 +3601,21 @@ QueryBuilder.define('sortable', function(options) {
     });
 
     /**
+     * Remove drag handle from non-sortable groups
+     */
+    this.on('parseGroupFlags.filter', function(flags) {
+        if (flags.value.no_sortable === undefined) {
+            flags.value.no_sortable = options.default_no_sortable;
+        }
+    });
+
+    this.on('afterApplyGroupFlags', function(e, group) {
+        if (group.flags.no_sortable) {
+            group.$el.find('.drag-handle').remove();
+        }
+    });
+
+    /**
      * Modify templates
      */
     this.on('getGroupTemplate.filter', function(h, level) {
@@ -3746,14 +3774,15 @@ QueryBuilder.defaults({
             };
         },
 
-        'numbered': function() {
+        'numbered': function(char) {
+            if (!char || char.length > 1) char = '$';
             var index = 0;
             var params = [];
             return {
                 add: function(rule, value) {
                     params.push(value);
                     index++;
-                    return '$' + index;
+                    return char + index;
                 },
                 run: function() {
                     return params;
@@ -3761,7 +3790,8 @@ QueryBuilder.defaults({
             };
         },
 
-        'named': function() {
+        'named': function(char) {
+            if (!char || char.length > 1) char = ':';
             var indexes = {};
             var params = {};
             return {
@@ -3769,7 +3799,7 @@ QueryBuilder.defaults({
                     if (!indexes[rule.field]) indexes[rule.field] = 1;
                     var key = rule.field + '_' + (indexes[rule.field]++);
                     params[key] = value;
-                    return ':' + key;
+                    return char + key;
                 },
                 run: function() {
                     return params;
@@ -3792,24 +3822,30 @@ QueryBuilder.defaults({
             };
         },
 
-        'numbered': function(values) {
+        'numbered': function(values, char) {
+            if (!char || char.length > 1) char = '$';
+            var regex1 = new RegExp('^\\' + char + '[0-9]+$');
+            var regex2 = new RegExp('\\' + char + '([0-9]+)', 'g');
             return {
                 parse: function(v) {
-                    return /^\$[0-9]+$/.test(v) ? values[v.slice(1) - 1] : v;
+                    return regex1.test(v) ? values[v.slice(1) - 1] : v;
                 },
                 esc: function(sql) {
-                    return sql.replace(/\$([0-9]+)/g, '\'$$$1\'');
+                    return sql.replace(regex2, '\'' + (char == '$' ? '$$' : char) + '$1\'');
                 }
             };
         },
 
-        'named': function(values) {
+        'named': function(values, char) {
+            if (!char || char.length > 1) char = ':';
+            var regex1 = new RegExp('^\\' + char);
+            var regex2 = new RegExp('\\' + char + '(' + Object.keys(values).join('|') + ')', 'g');
             return {
                 parse: function(v) {
-                    return /^:/.test(v) ? values[v.slice(1)] : v;
+                    return regex1.test(v) ? values[v.slice(1)] : v;
                 },
                 esc: function(sql) {
-                    return sql.replace(new RegExp(':(' + Object.keys(values).join('|') + ')', 'g'), '\':$1\'');
+                    return sql.replace(regex2, '\'' + (char == '$' ? '$$' : char) + '$1\'');
                 }
             };
         }
@@ -3823,7 +3859,7 @@ QueryBuilder.extend({
     /**
      * Get rules as SQL query
      * @throws UndefinedSQLConditionError, UndefinedSQLOperatorError
-     * @param stmt {false|string} use prepared statements - false, 'question_mark' or 'numbered'
+     * @param stmt {boolean|string} use prepared statements - false, 'question_mark', 'numbered', 'numbered(@)', 'named', 'named(@)'
      * @param nl {bool} output with new lines
      * @param data {object} (optional) rules
      * @return {object}
@@ -3832,12 +3868,13 @@ QueryBuilder.extend({
         data = (data === undefined) ? this.getRules() : data;
         nl = (nl === true) ? '\n' : ' ';
 
-        if (stmt === true || stmt === undefined) stmt = 'question_mark';
-        if (typeof stmt == 'string') stmt = this.settings.sqlStatements[stmt]();
+        if (stmt === true) stmt = 'question_mark';
+        if (typeof stmt == 'string') {
+            var config = getStmtConfig(stmt);
+            stmt = this.settings.sqlStatements[config[1]](config[2]);
+        }
 
         var self = this;
-        var bind_index = 1;
-        var bind_params = [];
 
         var sql = (function parse(data) {
             if (!data.condition) {
@@ -3924,6 +3961,7 @@ QueryBuilder.extend({
      * Convert SQL to rules
      * @throws ConfigError, SQLParseError, UndefinedSQLOperatorError
      * @param data {object} query object
+     * @param stmt {boolean|string} use prepared statements - false, 'question_mark', 'numbered', 'numbered(@)', 'named', 'named(@)'
      * @return {object}
      */
     getRulesFromSQL: function(data, stmt) {
@@ -3936,8 +3974,14 @@ QueryBuilder.extend({
         if (typeof data == 'string') {
             data = { sql: data };
         }
+
+        if (stmt === true) stmt = 'question_mark';
         if (typeof stmt == 'string') {
-            stmt = this.settings.sqlRuleStatement[stmt](data.params);
+            var config = getStmtConfig(stmt);
+            stmt = this.settings.sqlRuleStatement[config[1]](data.params, config[2]);
+        }
+
+        if (stmt) {
             data.sql = stmt.esc(data.sql);
         }
 
@@ -4052,6 +4096,12 @@ QueryBuilder.extend({
         this.setRules(this.getRulesFromSQL(data, stmt));
     }
 });
+
+function getStmtConfig(stmt) {
+    var config = stmt.match(/(question_mark|numbered|named)(?:\((.)\))?/);
+    if (!config) config = [null, 'question_mark', undefined];
+    return config;
+}
 
 
 /*!
